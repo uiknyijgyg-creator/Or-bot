@@ -82,7 +82,6 @@ async def get_ocr_model():
 async def get_lama_model():
     """يحمّل LaMa inpainting مرة واحدة فقط."""
     global _lama_model
-    # ✅ إصلاح 1: نفس الحماية
     if _executor is None:
         raise RuntimeError("البوت لم يكتمل تشغيله بعد، انتظر لحظة وأعد المحاولة.")
     async with _lama_lock:
@@ -90,8 +89,19 @@ async def get_lama_model():
             log.info("⏳ تحميل LaMa inpainting …")
             loop = asyncio.get_running_loop()
             def _load():
+                import torch
                 from simple_lama_inpainting import SimpleLama  # type: ignore
-                return SimpleLama()
+                # ✅ إصلاح: تحميل النموذج على CPU صراحةً بغض النظر عن كيفية حفظه
+                original_load = torch.jit.load
+                def patched_load(f, *args, **kwargs):
+                    kwargs.setdefault("map_location", torch.device("cpu"))
+                    return original_load(f, *args, **kwargs)
+                torch.jit.load = patched_load
+                try:
+                    model = SimpleLama()
+                finally:
+                    torch.jit.load = original_load  # استعادة الأصلي
+                return model
             _lama_model = await loop.run_in_executor(_executor, _load)
             log.info("✅ LaMa جاهز")
     return _lama_model
@@ -351,6 +361,8 @@ async def process_zip(
     mode: str,
     uid: int,
     on_progress: Callable[[int, int, str], Awaitable[None]],
+    ocr,
+    lama,
 ) -> tuple[bytes, int, int]:
     """
     يعالج ZIP ويرجع (zip_bytes_new, success, total).
@@ -394,10 +406,6 @@ async def process_zip(
 
     if not raw:
         raise ValueError("كل الصور في ZIP تالفة أو لا يمكن قراءتها!")
-
-    # ── تحميل النماذج بالتوازي ──
-    # ✅ إصلاح 3: تحميل OCR و LaMa في نفس الوقت بدل التسلسل → أسرع عند أول طلب
-    ocr, lama = await asyncio.gather(get_ocr_model(), get_lama_model())
 
     total        = len(raw)
     success      = 0
@@ -524,7 +532,45 @@ async def handle_zip(
         return
 
     try:
-        await edit(status, content="🔬 تحميل نماذج OCR + LaMa…")
+        await edit(status, content="🔬 تحميل نماذج OCR + LaMa… (قد يأخذ دقيقتين في أول مرة)")
+    except discord.HTTPException:
+        pass
+
+    # ✅ تحديث الرسالة كل 10 ثوانٍ أثناء تحميل النماذج لمنع ظهور "عالق"
+    loading_task = None
+    async def _keep_alive():
+        dots = 0
+        while True:
+            await asyncio.sleep(10)
+            dots = (dots % 3) + 1
+            try:
+                await edit(status, content=f"🔬 تحميل نماذج OCR + LaMa{'.' * dots} (قد يأخذ دقيقتين في أول مرة)")
+            except discord.HTTPException:
+                pass
+
+    loading_task = asyncio.create_task(_keep_alive())
+    try:
+        # ✅ تحميل تسلسلي لتقليل ذروة الذاكرة (OCR أولاً ثم LaMa)
+        ocr_ready  = await asyncio.wait_for(get_ocr_model(), timeout=300)
+        lama_ready = await asyncio.wait_for(get_lama_model(), timeout=300)
+    except asyncio.TimeoutError:
+        loading_task.cancel()
+        try:    await edit(status, content="❌ انتهت مهلة تحميل النماذج (5 دقائق). أعد المحاولة لاحقاً.")
+        except discord.HTTPException:
+            await channel.send("❌ انتهت مهلة تحميل النماذج. أعد المحاولة.")
+        return
+    except Exception as ex:
+        loading_task.cancel()
+        try:    await edit(status, content=f"❌ فشل تحميل النماذج: `{ex}`")
+        except discord.HTTPException:
+            await channel.send(f"❌ فشل تحميل النماذج: `{ex}`")
+        return
+    finally:
+        if loading_task and not loading_task.done():
+            loading_task.cancel()
+
+    try:
+        await edit(status, content="✅ النماذج جاهزة — بدء تنظيف الصور…")
     except discord.HTTPException:
         pass
 
@@ -548,7 +594,7 @@ async def handle_zip(
                 pass
 
         try:
-            new_zip, success, total = await process_zip(zip_bytes, mode, uid, on_progress)
+            new_zip, success, total = await process_zip(zip_bytes, mode, uid, on_progress, ocr_ready, lama_ready)
 
         except asyncio.CancelledError:
             try:    await edit(status, content="🚫 **تم إلغاء العملية.**")
@@ -557,16 +603,20 @@ async def handle_zip(
             return
 
         except ValueError as e:
-            try:    await edit(status, content=f"❌ {e}")
+            msg = f"❌ {e}"[:1900]
+            try:    await edit(status, content=msg)
             except discord.HTTPException:
-                await channel.send(f"❌ {e}")
+                await channel.send(msg)
             return
 
         except Exception as e:
             log.exception("خطأ غير متوقع في process_zip")
-            try:    await edit(status, content=f"❌ خطأ غير متوقع: `{e}`")
+            # ✅ إصلاح: تقليص رسالة الخطأ — PyTorch يرسل رسائل أطول من 2000 حرف
+            short_err = str(e).split("\n")[0][:300]
+            msg = f"❌ خطأ غير متوقع: `{short_err}`"
+            try:    await edit(status, content=msg)
             except discord.HTTPException:
-                await channel.send(f"❌ خطأ غير متوقع: `{e}`")
+                await channel.send(msg)
             return
 
         out_name = Path(attachment.filename).stem + "_cleaned.zip"
@@ -744,8 +794,9 @@ async def on_ready() -> None:
     # Pre-warm النماذج في الخلفية بالتوازي (يسرّع أول طلب)
     async def _warm():
         try:
-            # ✅ إصلاح 4: تحميل النموذجين بالتوازي بدل التسلسل
-            await asyncio.gather(get_ocr_model(), get_lama_model())
+            # تحميل تسلسلي في الـ pre-warm لتقليل ذروة الذاكرة
+            await get_ocr_model()
+            await get_lama_model()
             log.info("🔥 النماذج جاهزة في الذاكرة")
         except Exception as e:
             log.warning(f"⚠️ Pre-warm فشل (سيُعاد التحميل عند أول طلب): {e}")
