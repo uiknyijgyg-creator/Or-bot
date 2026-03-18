@@ -1,0 +1,23 @@
+# ── Discord ──────────────────────────────
+discord.py>=2.3.0
+
+# ── HTTP ─────────────────────────────────
+aiohttp>=3.9.0
+
+# ── Image processing ─────────────────────
+Pillow>=10.0.0
+numpy>=1.24.0
+opencv-python-headless>=4.8.0
+
+# ── OCR ──────────────────────────────────
+manga-ocr>=0.1.10          # نموذج OCR متخصص في المانجا
+
+# ── Inpainting ───────────────────────────
+simple-lama-inpainting>=0.1.0   # LaMa inpainting بدون تعقيد
+
+# ── PyTorch (مطلوب لـ manga-ocr و LaMa) ─
+# لو عندك GPU:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+# لو CPU فقط (أبطأ):
+torch>=2.0.0
+torchvision>=0.15.0
