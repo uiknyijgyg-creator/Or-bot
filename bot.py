@@ -576,13 +576,15 @@ async def handle_zip(
         except discord.HTTPException:
             await channel.send(embed=embed)
 
+        # ✅ إصلاح: إرسال الملف عبر reply() للـ slash commands
+        # channel.send() يفشل بعد انتهاء الـ interaction timeout
         try:
-            await channel.send(
+            await reply(
                 file=discord.File(io.BytesIO(new_zip), filename=out_name)
             )
         except discord.HTTPException as e:
             msg = (
-                "❌ الملف الناتج أكبر من حد Discord (>8MB). جرب ZIP أصغر."
+                "❌ الملف الناتج أكبر من حد Discord (25MB). جرب ZIP أصغر."
                 if e.status == 413
                 else f"❌ فشل إرسال الملف: `{e.text}`"
             )
@@ -703,8 +705,7 @@ async def on_message(message: discord.Message) -> None:
             else:
                 mode = "manga"
 
-            # ✅ إصلاح closure: تمرير att و message كقيم افتراضية
-            # يضمن أن كل دالة تشير لنسخة att/message الصحيحة
+            # ✅ إصلاح: تمرير كل الـ kwargs (يشمل file=) لدعم إرسال الملف
             async def reply(content=None, _m=message, **kw):
                 return await _m.reply(content=content, **kw)
             async def edit(msg, content=None, _att=att, **kw):
